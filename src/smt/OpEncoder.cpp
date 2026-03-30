@@ -71,32 +71,17 @@ z3::expr OpEncoder::encodeConstant(const Operation &op) {
   int resultId = op.resultIds.at(0);
   const Value &resultVal = prog_.getValue(resultId);
 
-  // Create a fresh UF for this constant
-  std::string name = freshName("const");
-  z3::func_decl func = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
-
-  TensorRepr repr{func, resultVal.type.shape, resultVal.type.isScalar()};
-  tensors_.registerResult(resultId, repr);
-
   z3::expr constExpr = z3ctx_.mkReal(*op.constantValue);
 
-  if (resultVal.type.isScalar()) {
-    // Scalar: func() == constant
-    return repr.scalarExpr() == constExpr;
-  } else {
-    // Tensor constant: forall indices, func(indices) == constant
-    // For static shapes, use universally quantified constraint.
-    // Since Z3 will search existentially over indices, we define the function
-    // such that it equals the constant everywhere.
-    auto indices = z3ctx_.mkIndexVars(name, resultVal.type.rank());
-    z3::expr app = repr.apply(indices);
-    z3::expr body = z3::implies(
-        z3ctx_.mkShapeBounds(indices, resultVal.type.shape), app == constExpr);
-    z3::expr_vector qvars(z3ctx_.ctx());
-    for (auto &idx : indices)
-      qvars.push_back(idx);
-    return z3::forall(qvars, body);
-  }
+  // Use expression-based encoding: constant returns the same value everywhere.
+  // No UF or quantifier needed.
+  std::string name = freshName("const");
+  z3::func_decl dummyFunc = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
+  TensorRepr repr{
+      dummyFunc, resultVal.type.shape, resultVal.type.isScalar(),
+      [constExpr](const std::vector<z3::expr> &) { return constExpr; }};
+  tensors_.registerResult(resultId, repr);
+  return z3ctx_.ctx().bool_val(true); // no constraints needed
 }
 
 z3::expr OpEncoder::encodeBinaryF(const Operation &op,
@@ -109,50 +94,33 @@ z3::expr OpEncoder::encodeBinaryF(const Operation &op,
   int resultId = op.resultIds[0];
   const Value &resultVal = prog_.getValue(resultId);
 
+  // Expression-based encoding: result(i) = lhs(i) OP rhs(i)
+  // No UF or quantifier — just compose the lambda.
   std::string name = freshName("binf");
-  z3::func_decl func = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
-  TensorRepr repr{func, resultVal.type.shape, resultVal.type.isScalar()};
+  z3::func_decl dummyFunc = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
+
+  // Capture operand reprs by value to avoid dangling references
+  TensorRepr lhsCopy = lhs;
+  TensorRepr rhsCopy = rhs;
+  TensorRepr repr{dummyFunc, resultVal.type.shape, resultVal.type.isScalar(),
+                  [lhsCopy, rhsCopy,
+                   opStr](const std::vector<z3::expr> &indices) -> z3::expr {
+                    z3::expr l = indices.empty() ? lhsCopy.scalarExpr()
+                                                 : lhsCopy.apply(indices);
+                    z3::expr r = indices.empty() ? rhsCopy.scalarExpr()
+                                                 : rhsCopy.apply(indices);
+                    if (opStr == "add")
+                      return l + r;
+                    if (opStr == "sub")
+                      return l - r;
+                    if (opStr == "mul")
+                      return l * r;
+                    if (opStr == "div")
+                      return l / r;
+                    throw std::runtime_error("Unknown op: " + opStr);
+                  }};
   tensors_.registerResult(resultId, repr);
-
-  if (resultVal.type.isScalar()) {
-    z3::expr l = lhs.scalarExpr();
-    z3::expr r = rhs.scalarExpr();
-    z3::expr res = repr.scalarExpr();
-    if (opStr == "add")
-      return res == (l + r);
-    if (opStr == "sub")
-      return res == (l - r);
-    if (opStr == "mul")
-      return res == (l * r);
-    if (opStr == "div")
-      return res == (l / r);
-    throw std::runtime_error("Unknown binary op: " + opStr);
-  }
-
-  // Tensor: forall indices in bounds, result(i) = lhs(i) OP rhs(i)
-  auto indices = z3ctx_.mkIndexVars(name, resultVal.type.rank());
-  z3::expr lExpr = lhs.apply(indices);
-  z3::expr rExpr = rhs.apply(indices);
-  z3::expr resExpr = repr.apply(indices);
-
-  z3::expr opExpr(z3ctx_.ctx());
-  if (opStr == "add")
-    opExpr = lExpr + rExpr;
-  else if (opStr == "sub")
-    opExpr = lExpr - rExpr;
-  else if (opStr == "mul")
-    opExpr = lExpr * rExpr;
-  else if (opStr == "div")
-    opExpr = lExpr / rExpr;
-  else
-    throw std::runtime_error("Unknown binary op: " + opStr);
-
-  z3::expr body = z3::implies(
-      z3ctx_.mkShapeBounds(indices, resultVal.type.shape), resExpr == opExpr);
-  z3::expr_vector qvars(z3ctx_.ctx());
-  for (auto &idx : indices)
-    qvars.push_back(idx);
-  return z3::forall(qvars, body);
+  return z3ctx_.ctx().bool_val(true);
 }
 
 z3::expr OpEncoder::encodeNegF(const Operation &op) {
@@ -164,22 +132,16 @@ z3::expr OpEncoder::encodeNegF(const Operation &op) {
   const Value &resultVal = prog_.getValue(resultId);
 
   std::string name = freshName("negf");
-  z3::func_decl func = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
-  TensorRepr repr{func, resultVal.type.shape, resultVal.type.isScalar()};
+  z3::func_decl dummyFunc = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
+  TensorRepr opCopy = operand;
+  TensorRepr repr{dummyFunc, resultVal.type.shape, resultVal.type.isScalar(),
+                  [opCopy](const std::vector<z3::expr> &indices) -> z3::expr {
+                    z3::expr v = indices.empty() ? opCopy.scalarExpr()
+                                                 : opCopy.apply(indices);
+                    return -v;
+                  }};
   tensors_.registerResult(resultId, repr);
-
-  if (resultVal.type.isScalar()) {
-    return repr.scalarExpr() == -operand.scalarExpr();
-  }
-
-  auto indices = z3ctx_.mkIndexVars(name, resultVal.type.rank());
-  z3::expr body =
-      z3::implies(z3ctx_.mkShapeBounds(indices, resultVal.type.shape),
-                  repr.apply(indices) == -operand.apply(indices));
-  z3::expr_vector qvars(z3ctx_.ctx());
-  for (auto &idx : indices)
-    qvars.push_back(idx);
-  return z3::forall(qvars, body);
+  return z3ctx_.ctx().bool_val(true);
 }
 
 z3::expr OpEncoder::encodeBinaryI(const Operation &op,
@@ -197,24 +159,19 @@ z3::expr OpEncoder::encodeMaxF(const Operation &op) {
   const Value &resultVal = prog_.getValue(resultId);
 
   std::string name = freshName("maxf");
-  z3::func_decl func = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
-  TensorRepr repr{func, resultVal.type.shape, resultVal.type.isScalar()};
+  z3::func_decl dummyFunc = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
+  TensorRepr lhsCopy = lhs, rhsCopy = rhs;
+  TensorRepr repr{
+      dummyFunc, resultVal.type.shape, resultVal.type.isScalar(),
+      [lhsCopy, rhsCopy](const std::vector<z3::expr> &indices) -> z3::expr {
+        z3::expr l =
+            indices.empty() ? lhsCopy.scalarExpr() : lhsCopy.apply(indices);
+        z3::expr r =
+            indices.empty() ? rhsCopy.scalarExpr() : rhsCopy.apply(indices);
+        return z3::ite(l >= r, l, r);
+      }};
   tensors_.registerResult(resultId, repr);
-
-  if (resultVal.type.isScalar()) {
-    z3::expr l = lhs.scalarExpr(), r = rhs.scalarExpr();
-    return repr.scalarExpr() == z3::ite(l >= r, l, r);
-  }
-
-  auto indices = z3ctx_.mkIndexVars(name, resultVal.type.rank());
-  z3::expr l = lhs.apply(indices), r = rhs.apply(indices);
-  z3::expr body =
-      z3::implies(z3ctx_.mkShapeBounds(indices, resultVal.type.shape),
-                  repr.apply(indices) == z3::ite(l >= r, l, r));
-  z3::expr_vector qvars(z3ctx_.ctx());
-  for (auto &idx : indices)
-    qvars.push_back(idx);
-  return z3::forall(qvars, body);
+  return z3ctx_.ctx().bool_val(true);
 }
 
 z3::expr OpEncoder::encodeMinF(const Operation &op) {
@@ -227,24 +184,19 @@ z3::expr OpEncoder::encodeMinF(const Operation &op) {
   const Value &resultVal = prog_.getValue(resultId);
 
   std::string name = freshName("minf");
-  z3::func_decl func = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
-  TensorRepr repr{func, resultVal.type.shape, resultVal.type.isScalar()};
+  z3::func_decl dummyFunc = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
+  TensorRepr lhsCopy = lhs, rhsCopy = rhs;
+  TensorRepr repr{
+      dummyFunc, resultVal.type.shape, resultVal.type.isScalar(),
+      [lhsCopy, rhsCopy](const std::vector<z3::expr> &indices) -> z3::expr {
+        z3::expr l =
+            indices.empty() ? lhsCopy.scalarExpr() : lhsCopy.apply(indices);
+        z3::expr r =
+            indices.empty() ? rhsCopy.scalarExpr() : rhsCopy.apply(indices);
+        return z3::ite(l <= r, l, r);
+      }};
   tensors_.registerResult(resultId, repr);
-
-  if (resultVal.type.isScalar()) {
-    z3::expr l = lhs.scalarExpr(), r = rhs.scalarExpr();
-    return repr.scalarExpr() == z3::ite(l <= r, l, r);
-  }
-
-  auto indices = z3ctx_.mkIndexVars(name, resultVal.type.rank());
-  z3::expr l = lhs.apply(indices), r = rhs.apply(indices);
-  z3::expr body =
-      z3::implies(z3ctx_.mkShapeBounds(indices, resultVal.type.shape),
-                  repr.apply(indices) == z3::ite(l <= r, l, r));
-  z3::expr_vector qvars(z3ctx_.ctx());
-  for (auto &idx : indices)
-    qvars.push_back(idx);
-  return z3::forall(qvars, body);
+  return z3ctx_.ctx().bool_val(true);
 }
 
 std::vector<z3::expr>
@@ -775,36 +727,125 @@ z3::expr OpEncoder::encodeLinalgGeneric(const Operation &op) {
   bool hasReduction = !reductionDims.empty();
 
   if (!hasReduction) {
-    // ---- Pure parallel (elementwise) ----
-    auto iterVars = z3ctx_.mkIndexVars(name + "_d", numIterDims);
+    // ---- Pure parallel (elementwise) — expr-based, no quantifiers ----
+    // Build an elemFn lambda that computes result(iterVars) by evaluating
+    // the body on input tensors indexed via the affine maps.
+    // Capture all needed data by value for the lambda.
 
-    z3::expr bounds = z3ctx_.ctx().bool_val(true);
-    for (int d = 0; d < numIterDims; d++)
-      bounds = bounds && z3ctx_.mkBoundsConstraint(iterVars[d], iterBounds[d]);
+    struct ParallelCapture {
+      Operation::LinalgRegion region;
+      std::vector<TensorRepr> inputReprs;
+      std::vector<TensorRepr> outputReprs;
+      Operation::AffineMap outMap;
+      int numIterDims;
+    };
 
-    // Build block args
-    std::vector<z3::expr> blockVals;
-    for (int m = 0; m < region.numInputs; m++) {
-      const TensorRepr &inRepr = tensors_.getRepr(op.operandIds[m]);
-      const auto &inMap = region.indexingMaps[m];
-      blockVals.push_back(inRepr.apply(mapAffineIndices(inMap, iterVars)));
-    }
-    for (int m = 0; m < region.numOutputs; m++) {
-      int idx = region.numInputs + m;
-      const TensorRepr &outRepr = tensors_.getRepr(op.operandIds[idx]);
-      const auto &oMap = region.indexingMaps[idx];
-      blockVals.push_back(outRepr.apply(mapAffineIndices(oMap, iterVars)));
-    }
+    auto capture = std::make_shared<ParallelCapture>();
+    capture->region = region;
+    capture->outMap = outMap;
+    capture->numIterDims = numIterDims;
+    for (int m = 0; m < region.numInputs; m++)
+      capture->inputReprs.push_back(tensors_.getRepr(op.operandIds[m]));
+    for (int m = 0; m < region.numOutputs; m++)
+      capture->outputReprs.push_back(
+          tensors_.getRepr(op.operandIds[region.numInputs + m]));
 
-    z3::expr yieldedVal = evalBody(region, blockVals);
+    // The output map tells us how iteration indices map to output tensor
+    // indices. For the elemFn, we receive output indices and need to
+    // reverse-map to iteration indices. For simple identity maps
+    // (d0,d1)->(d0,d1), this is trivial. For general maps, we invert:
+    // iterVars[outMap.resultDims[k]] = outIdx[k].
+    auto &thisRegion = capture->region;
+    auto &thisOutMap = capture->outMap;
 
-    std::vector<z3::expr> outIndices = mapAffineIndices(outMap, iterVars);
+    TensorRepr repr{
+        z3ctx_.mkTensorFunc(name, resultVal.type.rank()), resultVal.type.shape,
+        resultVal.type.isScalar(),
+        [capture](const std::vector<z3::expr> &outIdx) -> z3::expr {
+          auto &reg = capture->region;
+          auto &om = capture->outMap;
+          int nIter = capture->numIterDims;
 
-    z3::expr body = z3::implies(bounds, repr.apply(outIndices) == yieldedVal);
-    z3::expr_vector qvars(z3ctx_.ctx());
-    for (auto &v : iterVars)
-      qvars.push_back(v);
-    return z3::forall(qvars, body);
+          // Reconstruct iteration variables from output indices
+          // iterVars[om.resultDims[k]] = outIdx[k]; others default to 0
+          z3::context &c = outIdx.empty() ? capture->inputReprs[0].func.ctx()
+                                          : outIdx[0].ctx();
+          std::vector<z3::expr> iterVars;
+          for (int d = 0; d < nIter; d++)
+            iterVars.push_back(c.int_val(0));
+          for (size_t k = 0; k < om.resultDims.size() && k < outIdx.size(); k++)
+            iterVars[om.resultDims[k]] = outIdx[k];
+
+          // Build block args
+          std::vector<z3::expr> blockVals;
+          for (size_t m = 0; m < capture->inputReprs.size(); m++) {
+            auto &inMap = reg.indexingMaps[m];
+            std::vector<z3::expr> mapped;
+            for (int r : inMap.resultDims)
+              mapped.push_back(iterVars[r]);
+            blockVals.push_back(capture->inputReprs[m].apply(mapped));
+          }
+          for (size_t m = 0; m < capture->outputReprs.size(); m++) {
+            auto &oMap = reg.indexingMaps[reg.numInputs + m];
+            std::vector<z3::expr> mapped;
+            for (int r : oMap.resultDims)
+              mapped.push_back(iterVars[r]);
+            blockVals.push_back(capture->outputReprs[m].apply(mapped));
+          }
+
+          // Evaluate body inline
+          for (auto &bop : reg.bodyOps) {
+            z3::expr res(c);
+            switch (bop.kind) {
+            case OpKind::Constant:
+              res = c.real_val(
+                  std::to_string(bop.constantValue.value_or(0.0)).c_str());
+              break;
+            case OpKind::AddF:
+            case OpKind::AddI:
+              res = blockVals[bop.operandIndices[0]] +
+                    blockVals[bop.operandIndices[1]];
+              break;
+            case OpKind::SubF:
+            case OpKind::SubI:
+              res = blockVals[bop.operandIndices[0]] -
+                    blockVals[bop.operandIndices[1]];
+              break;
+            case OpKind::MulF:
+            case OpKind::MulI:
+              res = blockVals[bop.operandIndices[0]] *
+                    blockVals[bop.operandIndices[1]];
+              break;
+            case OpKind::DivF:
+              res = blockVals[bop.operandIndices[0]] /
+                    blockVals[bop.operandIndices[1]];
+              break;
+            case OpKind::NegF:
+              res = -blockVals[bop.operandIndices[0]];
+              break;
+            case OpKind::MaxF: {
+              auto a = blockVals[bop.operandIndices[0]],
+                   b = blockVals[bop.operandIndices[1]];
+              res = z3::ite(a >= b, a, b);
+              break;
+            }
+            case OpKind::MinF: {
+              auto a = blockVals[bop.operandIndices[0]],
+                   b = blockVals[bop.operandIndices[1]];
+              res = z3::ite(a <= b, a, b);
+              break;
+            }
+            default:
+              throw std::runtime_error(
+                  "Unsupported body op in expr-based linalg.generic");
+            }
+            blockVals.push_back(res);
+          }
+          return blockVals[reg.yieldIndex];
+        }};
+
+    tensors_.registerResult(resultId, repr);
+    return z3ctx_.ctx().bool_val(true); // no quantified constraints
   }
 
   // ---- Reduction encoding (decomposed) ----
@@ -843,22 +884,32 @@ z3::expr OpEncoder::encodeLinalgGeneric(const Operation &op) {
   // Create a body signature string for structural matching.
   // For commutative ops, sort operand indices so (acc+x) matches (x+acc).
   auto isCommutative = [](OpKind k) {
-    return k == OpKind::AddF || k == OpKind::MulF ||
-           k == OpKind::AddI || k == OpKind::MulI ||
-           k == OpKind::MaxF || k == OpKind::MinF;
+    return k == OpKind::AddF || k == OpKind::MulF || k == OpKind::AddI ||
+           k == OpKind::MulI || k == OpKind::MaxF || k == OpKind::MinF;
   };
 
   std::string bodySignature;
+  // Include body ops
   for (auto &bop : region.bodyOps) {
     bodySignature += opKindToString(bop.kind) + ";";
     auto indices = bop.operandIndices;
-    if (isCommutative(bop.kind) && indices.size() == 2 && indices[0] > indices[1])
+    if (isCommutative(bop.kind) && indices.size() == 2 &&
+        indices[0] > indices[1])
       std::swap(indices[0], indices[1]);
     for (int idx : indices)
       bodySignature += std::to_string(idx) + ",";
     bodySignature += "|";
   }
   bodySignature += "yield=" + std::to_string(region.yieldIndex);
+  // Include indexing maps — different maps mean different input elements
+  for (size_t m = 0; m < region.indexingMaps.size(); m++) {
+    bodySignature += "/map" + std::to_string(m) + "=";
+    for (int d : region.indexingMaps[m].resultDims)
+      bodySignature += std::to_string(d) + ",";
+  }
+  // Include iterator types
+  for (auto &it : region.iteratorTypes)
+    bodySignature += "/" + it;
 
   // Create a shared reduction result UF name from the body signature
   // This means two programs with the same body structure will share
@@ -884,8 +935,8 @@ z3::expr OpEncoder::encodeLinalgGeneric(const Operation &op) {
   // with the same body signature.
 
   // Create the abstract reduction result UF
-  // Arguments: (parallel indices) + (init value) + (all input tensor UFs at par)
-  // This captures enough to determine the reduction result.
+  // Arguments: (parallel indices) + (init value) + (all input tensor UFs at
+  // par) This captures enough to determine the reduction result.
   int abstractRank = numParallel;
   z3::func_decl abstractRedFunc = z3ctx_.mkTensorFunc(sharedName, abstractRank);
 
@@ -904,7 +955,8 @@ z3::expr OpEncoder::encodeLinalgGeneric(const Operation &op) {
   //
   // Additionally, we need the init value to be part of the abstract state.
   // Create a combined UF that takes (par_indices, init_value, input_values...)
-  // For simplicity, use a separate UF per unique (bodySignature + init + inputs).
+  // For simplicity, use a separate UF per unique (bodySignature + init +
+  // inputs).
 
   // The init tensor value at this parallel position
   const TensorRepr &initRepr =
@@ -914,24 +966,28 @@ z3::expr OpEncoder::encodeLinalgGeneric(const Operation &op) {
   for (int i = 0; i < numParallel; i++) {
     iterVarsForInit[parallelDims[i]] = parVars[i];
   }
-  std::vector<z3::expr> initIndices = mapAffineIndices(initMap, iterVarsForInit);
+  std::vector<z3::expr> initIndices =
+      mapAffineIndices(initMap, iterVarsForInit);
   z3::expr initVal = initRepr.apply(initIndices);
 
   // Build the abstract reduce with init as an extra argument
   int reduceArgRank = numParallel + 1; // par indices + init value
-  z3::func_decl reduceFunc = z3ctx_.mkTensorFunc(sharedName + "_r", reduceArgRank);
+  z3::func_decl reduceFunc =
+      z3ctx_.mkTensorFunc(sharedName + "_r", reduceArgRank);
 
   // Apply the reduce function
   z3::expr_vector reduceArgs(z3ctx_.ctx());
-  for (auto &p : parVars) reduceArgs.push_back(p);
+  for (auto &p : parVars)
+    reduceArgs.push_back(p);
   reduceArgs.push_back(initVal);
   z3::expr reduceResult = reduceFunc(reduceArgs);
 
   // Constraint: result(outIndices) = reduce(parVars, init)
-  z3::expr resultConstraint = z3::implies(
-      parBounds, repr.apply(outIndices) == reduceResult);
+  z3::expr resultConstraint =
+      z3::implies(parBounds, repr.apply(outIndices) == reduceResult);
   z3::expr_vector qvars(z3ctx_.ctx());
-  for (auto &p : parVars) qvars.push_back(p);
+  for (auto &p : parVars)
+    qvars.push_back(p);
 
   return z3::forall(qvars, resultConstraint);
 }
