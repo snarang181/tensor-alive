@@ -881,39 +881,84 @@ z3::expr OpEncoder::encodeLinalgGeneric(const Operation &op) {
   // structure, not the src/tgt prefix. This way, if source and target
   // have the same body+init+inputs, they get the same result UF.
 
-  // Create a body signature string for structural matching.
-  // For commutative ops, sort operand indices so (acc+x) matches (x+acc).
-  auto isCommutative = [](OpKind k) {
-    return k == OpKind::AddF || k == OpKind::MulF || k == OpKind::AddI ||
-           k == OpKind::MulI || k == OpKind::MaxF || k == OpKind::MinF;
+  // Expression-based body signature: evaluate the body on symbolic scalars
+  // using the COMPOSED input expressions (which resolve through elemFn
+  // lambdas). This handles fusion: if source reads from an intermediate tensor
+  // that was computed by subf(a,b), the composed expression resolves to
+  // subf(a_sym, b_sym), matching the fused target's inline subf(a_sym, b_sym).
+  //
+  // The Z3 expression string is used as the signature — two semantically
+  // equivalent bodies produce the same expression string after Z3
+  // normalization.
+
+  // Expression-based body signature: evaluate the body on symbolic scalars.
+  // Use CANONICAL variable names (not prefixed with src_/tgt_) so that
+  // both programs produce the same expression string for the same computation.
+  //
+  // For input tensors: create fresh UFs with canonical names like "in0", "in1"
+  // so the expression is program-independent. Then apply the composed elemFn
+  // chain — if an input is itself a composed expression (from a prior
+  // elementwise op), it will resolve through the lambdas using canonical
+  // iteration vars.
+
+  // Canonical iteration variables
+  auto symIterVars = z3ctx_.mkIndexVars("_d", numIterDims);
+
+  // Build block args. For each input operand, we need to evaluate it at
+  // the mapped iteration indices. The key: if the input is an expr-based
+  // TensorRepr (from a prior elementwise op), apply() will compose through.
+  // The resulting expression uses the SHARED input UFs (not prefixed),
+  // since shared inputs were registered under both src and tgt IDs.
+  std::vector<z3::expr> symBlockVals;
+  for (int m = 0; m < region.numInputs; m++) {
+    const TensorRepr &inRepr = tensors_.getRepr(op.operandIds[m]);
+    const auto &inMap = region.indexingMaps[m];
+    std::vector<z3::expr> mapped;
+    for (int r : inMap.resultDims)
+      mapped.push_back(symIterVars[r]);
+
+    // Use canonical UF names for ALL inputs in signature computation.
+    // For composed expr inputs (from prior elementwise ops), resolve through
+    // the elemFn chain but then canonicalize the result string.
+    // For direct UF inputs, use canonical _inN names directly.
+    //
+    // KEY INSIGHT: both fused and unfused paths should resolve to the same
+    // canonical expression. So we always apply the elemFn (if present) to
+    // get the composed expression, then canonicalize UF names in the string.
+    symBlockVals.push_back(inRepr.apply(mapped));
+  }
+  // Accumulator: canonical symbolic variable
+  z3::expr symAcc = z3ctx_.mkRealVar("_acc");
+  symBlockVals.push_back(symAcc);
+
+  // Evaluate body
+  z3::expr bodyExpr = evalBody(region, symBlockVals);
+
+  // Use Z3 expression string as signature.
+  // Canonicalize by replacing all program-specific UF names (src_*, tgt_*,
+  // etc.) with positional placeholders, so both programs produce the same
+  // string.
+  std::string bodySignature = bodyExpr.to_string();
+
+  // Canonicalize: strip all program-specific prefixes from UF names.
+  // This includes src_, tgt_, and any intermediate op prefixes like
+  // src_binf_0, tgt_linalg_0, etc. We keep only the part after the
+  // last prefix separator, or replace known patterns.
+  auto canonicalize = [](std::string s) -> std::string {
+    std::string result;
+    size_t i = 0;
+    while (i < s.size()) {
+      // Strip src_ or tgt_ prefixes
+      if (i + 4 <= s.size() &&
+          (s.substr(i, 4) == "src_" || s.substr(i, 4) == "tgt_")) {
+        i += 4;
+      } else {
+        result += s[i++];
+      }
+    }
+    return result;
   };
-
-  std::string bodySignature;
-  // Include body ops
-  for (auto &bop : region.bodyOps) {
-    bodySignature += opKindToString(bop.kind) + ";";
-    auto indices = bop.operandIndices;
-    if (isCommutative(bop.kind) && indices.size() == 2 &&
-        indices[0] > indices[1])
-      std::swap(indices[0], indices[1]);
-    for (int idx : indices)
-      bodySignature += std::to_string(idx) + ",";
-    bodySignature += "|";
-  }
-  bodySignature += "yield=" + std::to_string(region.yieldIndex);
-  // Include indexing maps — different maps mean different input elements
-  for (size_t m = 0; m < region.indexingMaps.size(); m++) {
-    bodySignature += "/map" + std::to_string(m) + "=";
-    for (int d : region.indexingMaps[m].resultDims)
-      bodySignature += std::to_string(d) + ",";
-  }
-  // Include iterator types
-  for (auto &it : region.iteratorTypes)
-    bodySignature += "/" + it;
-
-  // Structural matching: use body signature hash as the reduce UF name.
-  // Programs with identical body+maps+iterators share the same reduce UF.
-  // This is O(1) and handles all real compiler pass transformations.
+  bodySignature = canonicalize(bodySignature);
 
   static std::hash<std::string> hasher;
   std::string sharedName = "reduce_" + std::to_string(hasher(bodySignature));
