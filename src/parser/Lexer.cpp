@@ -84,13 +84,14 @@ Token Lexer::readIdentifierOrKeyword() {
   std::string text = src_.substr(start, pos_ - start);
 
   // Keywords
-  if (text == "func.func" || text == "func")
+  if (text == "func.func" || text == "func" ||
+      text == "cuda_tile.testing$func" || text == "entry")
     return makeToken(TokenKind::KW_func, text);
   if (text == "return" || text == "func.return")
     return makeToken(TokenKind::KW_return, text);
   if (text == "tensor")
     return makeToken(TokenKind::KW_tensor, text);
-  if (text == "module")
+  if (text == "module" || text == "cuda_tile.module")
     return makeToken(TokenKind::KW_module, text);
 
   return makeToken(TokenKind::Identifier, text);
@@ -173,6 +174,19 @@ Token Lexer::next() {
   case '?':
     advance();
     return makeToken(TokenKind::Identifier, "?");
+  case '!': {
+    // Dialect type prefix like !cuda_tile.tile — read as identifier
+    advance(); // skip !
+    size_t start = pos_;
+    while (!atEnd() && (std::isalnum(current()) || current() == '_' ||
+                        current() == '.' || current() == '$'))
+      advance();
+    std::string text = src_.substr(start, pos_ - start);
+    // Map !cuda_tile.tile to our tensor keyword
+    if (text == "cuda_tile.tile")
+      return makeToken(TokenKind::KW_tensor, text);
+    return makeToken(TokenKind::Identifier, "!" + text);
+  }
   case '"':
     return readString();
   default:

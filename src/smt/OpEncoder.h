@@ -31,7 +31,7 @@ private:
   const Program &prog_;
   std::string prefix_;
   int freshCounter_ = 0;
-  int emptyCounter_ = 0;  // shared counter for tensor.empty (reset per program)
+  int emptyCounter_ = 0; // shared counter for tensor.empty (reset per program)
 
   std::string freshName(const std::string &base);
 
@@ -49,6 +49,8 @@ private:
   z3::expr encodeLinalgFill(const Operation &op);
   z3::expr encodeLinalgPack(const Operation &op);
   z3::expr encodeLinalgUnpack(const Operation &op);
+  z3::expr encodeFmaF(const Operation &op);
+  z3::expr encodeReshape(const Operation &op);
   z3::expr encodeMaxF(const Operation &op);
   z3::expr encodeMinF(const Operation &op);
 
@@ -58,9 +60,8 @@ private:
 
   // Map an affine map's result expressions to Z3 index expressions,
   // substituting constants where resultDims[i] == -1.
-  std::vector<z3::expr>
-  mapAffineIndices(const Operation::AffineMap &map,
-                   const std::vector<z3::expr> &iterVars);
+  std::vector<z3::expr> mapAffineIndices(const Operation::AffineMap &map,
+                                         const std::vector<z3::expr> &iterVars);
 
   // Helper: compute linear index from multi-dimensional indices and shape
   z3::expr linearIndex(const std::vector<z3::expr> &indices,

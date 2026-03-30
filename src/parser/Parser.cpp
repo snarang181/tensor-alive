@@ -82,10 +82,16 @@ Program Parser::parse() {
 
 void Parser::parseModule(Program &prog) {
   expect(TokenKind::KW_module);
-  // optional attributes
-  while (cur_.kind == TokenKind::Identifier || cur_.kind == TokenKind::Hash)
+  // optional module name (@name) and attributes
+  while (cur_.kind == TokenKind::Identifier || cur_.kind == TokenKind::Hash ||
+         cur_.kind == TokenKind::At)
     advance();
   expect(TokenKind::LBrace);
+  // Skip nested module-like structures (cuda_tile.module can nest)
+  while (cur_.kind == TokenKind::KW_module) {
+    parseModule(prog);
+    return; // inner module already parsed the func
+  }
   parseFunc(prog);
   expect(TokenKind::RBrace);
 }
@@ -210,6 +216,29 @@ void Parser::parseOperation(Program &prog) {
     kind = OpKind::SubI;
   else if (opName == "arith.muli")
     kind = OpKind::MulI;
+  // cuda_tile dialect ops
+  else if (opName == "cuda_tile.addf")
+    kind = OpKind::AddF;
+  else if (opName == "cuda_tile.subf")
+    kind = OpKind::SubF;
+  else if (opName == "cuda_tile.mulf")
+    kind = OpKind::MulF;
+  else if (opName == "cuda_tile.divf")
+    kind = OpKind::DivF;
+  else if (opName == "cuda_tile.negf")
+    kind = OpKind::NegF;
+  else if (opName == "cuda_tile.addi")
+    kind = OpKind::AddI;
+  else if (opName == "cuda_tile.muli")
+    kind = OpKind::MulI;
+  else if (opName == "cuda_tile.fma")
+    kind = OpKind::FmaF;
+  else if (opName == "cuda_tile.broadcast")
+    kind = OpKind::Broadcast;
+  else if (opName == "cuda_tile.reshape")
+    kind = OpKind::Reshape;
+  else if (opName == "constant")
+    kind = OpKind::Constant;
   else if (opName == "tensor.collapse_shape")
     kind = OpKind::CollapseShape;
   else if (opName == "tensor.expand_shape")
@@ -243,10 +272,25 @@ void Parser::parseOperation(Program &prog) {
 
   if (kind == OpKind::Constant) {
     // arith.constant <value> : type
-    // The value is the next token (a number or dense attr)
+    // OR cuda_tile constant <f32: 2.0> : type
     if (check(TokenKind::Integer) || check(TokenKind::Float)) {
       op.constantValue = std::stod(cur_.text);
       advance();
+    } else if (check(TokenKind::LAngle)) {
+      // cuda_tile constant <f32: 2.0> format
+      advance(); // skip <
+      // Skip type prefix like "f32:" or "i32:"
+      if (check(TokenKind::Identifier))
+        advance(); // skip type name
+      if (match(TokenKind::Colon)) {
+      } // skip :
+      if (check(TokenKind::Integer) || check(TokenKind::Float)) {
+        op.constantValue = std::stod(cur_.text);
+        advance();
+      } else {
+        op.constantValue = 0.0;
+      }
+      expect(TokenKind::RAngle);
     } else if (check(TokenKind::Identifier) && cur_.text == "dense") {
       // dense<value> : type — support splat constants like dense<0.0>
       advance(); // skip "dense"
@@ -283,6 +327,20 @@ void Parser::parseOperation(Program &prog) {
     }
   } else if (kind == OpKind::NegF) {
     // Unary: %result = arith.negf %operand : type
+    std::string operand = parseValueName();
+    op.operandIds.push_back(prog.lookupValue(operand));
+  } else if (kind == OpKind::FmaF) {
+    // Ternary: %result = fma %a, %b, %c : type
+    std::string a = parseValueName();
+    op.operandIds.push_back(prog.lookupValue(a));
+    expect(TokenKind::Comma);
+    std::string b = parseValueName();
+    op.operandIds.push_back(prog.lookupValue(b));
+    expect(TokenKind::Comma);
+    std::string c = parseValueName();
+    op.operandIds.push_back(prog.lookupValue(c));
+  } else if (kind == OpKind::Reshape) {
+    // cuda_tile.reshape %input : type -> type (unary)
     std::string operand = parseValueName();
     op.operandIds.push_back(prog.lookupValue(operand));
   } else if (kind == OpKind::LinalgPack || kind == OpKind::LinalgUnpack) {
@@ -442,6 +500,20 @@ void Parser::parseOperation(Program &prog) {
     expect(TokenKind::Comma);
     std::string rhs = parseValueName();
     op.operandIds.push_back(prog.lookupValue(rhs));
+  }
+
+  // Skip optional cuda_tile attributes: rounding<...>, flush_to_zero, signed,
+  // etc.
+  while (checkIdent("rounding") || checkIdent("flush_to_zero") ||
+         checkIdent("signed") || checkIdent("unsigned")) {
+    advance(); // skip attribute name
+    if (check(TokenKind::LAngle)) {
+      advance(); // skip <
+      while (!check(TokenKind::RAngle) && !check(TokenKind::Eof))
+        advance();
+      if (check(TokenKind::RAngle))
+        advance();
+    }
   }
 
   // Consume type signature

@@ -25,6 +25,10 @@ z3::expr OpEncoder::encode(const Operation &op) {
     return encodeBinaryF(op, "div");
   case OpKind::NegF:
     return encodeNegF(op);
+  case OpKind::FmaF:
+    return encodeFmaF(op);
+  case OpKind::Reshape:
+    return encodeReshape(op);
   case OpKind::MaxF:
     return encodeMaxF(op);
   case OpKind::MinF:
@@ -147,6 +151,85 @@ z3::expr OpEncoder::encodeNegF(const Operation &op) {
 z3::expr OpEncoder::encodeBinaryI(const Operation &op,
                                   const std::string &opStr) {
   return encodeBinaryF(op, opStr);
+}
+
+z3::expr OpEncoder::encodeFmaF(const Operation &op) {
+  // fma(a, b, c) = a * b + c
+  if (op.operandIds.size() != 3 || op.resultIds.size() != 1)
+    throw std::runtime_error("FmaF expects 3 operands and 1 result");
+
+  const TensorRepr &a = tensors_.getRepr(op.operandIds[0]);
+  const TensorRepr &b = tensors_.getRepr(op.operandIds[1]);
+  const TensorRepr &c = tensors_.getRepr(op.operandIds[2]);
+  int resultId = op.resultIds[0];
+  const Value &resultVal = prog_.getValue(resultId);
+
+  std::string name = freshName("fma");
+  z3::func_decl dummyFunc = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
+  TensorRepr aCopy = a, bCopy = b, cCopy = c;
+  TensorRepr repr{
+      dummyFunc, resultVal.type.shape, resultVal.type.isScalar(),
+      [aCopy, bCopy, cCopy](const std::vector<z3::expr> &indices) -> z3::expr {
+        z3::expr av =
+            indices.empty() ? aCopy.scalarExpr() : aCopy.apply(indices);
+        z3::expr bv =
+            indices.empty() ? bCopy.scalarExpr() : bCopy.apply(indices);
+        z3::expr cv =
+            indices.empty() ? cCopy.scalarExpr() : cCopy.apply(indices);
+        return av * bv + cv;
+      }};
+  tensors_.registerResult(resultId, repr);
+  return z3ctx_.ctx().bool_val(true);
+}
+
+z3::expr OpEncoder::encodeReshape(const Operation &op) {
+  // Simple reshape: same elements, different shape.
+  // For cuda_tile.reshape on scalars (tile<f32> -> tile<1x1xf32>), this is
+  // just a shape change with the same value at every index.
+  if (op.operandIds.size() != 1 || op.resultIds.size() != 1)
+    throw std::runtime_error("Reshape expects 1 operand and 1 result");
+
+  const TensorRepr &input = tensors_.getRepr(op.operandIds[0]);
+  int resultId = op.resultIds[0];
+  const Value &resultVal = prog_.getValue(resultId);
+
+  // If input is scalar and output is tensor, broadcast the scalar
+  if (input.isScalar && !resultVal.type.isScalar()) {
+    std::string name = freshName("reshape");
+    z3::func_decl dummyFunc = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
+    TensorRepr inCopy = input;
+    TensorRepr repr{dummyFunc, resultVal.type.shape, false,
+                    [inCopy](const std::vector<z3::expr> &) -> z3::expr {
+                      return inCopy.scalarExpr();
+                    }};
+    tensors_.registerResult(resultId, repr);
+    return z3ctx_.ctx().bool_val(true);
+  }
+
+  // General reshape: use linear index mapping (same as collapse/expand)
+  std::string name = freshName("reshape");
+  z3::func_decl func = z3ctx_.mkTensorFunc(name, resultVal.type.rank());
+  TensorRepr repr{func, resultVal.type.shape, resultVal.type.isScalar()};
+  tensors_.registerResult(resultId, repr);
+
+  auto resultIndices = z3ctx_.mkIndexVars(name + "_r", resultVal.type.rank());
+  auto inputIndices = z3ctx_.mkIndexVars(name + "_i", input.shape.size());
+
+  z3::expr resultLinear = linearIndex(resultIndices, resultVal.type.shape);
+  z3::expr inputLinear = linearIndex(inputIndices, input.shape);
+
+  z3::expr body =
+      z3::implies(z3ctx_.mkShapeBounds(resultIndices, resultVal.type.shape) &&
+                      z3ctx_.mkShapeBounds(inputIndices, input.shape) &&
+                      (resultLinear == inputLinear),
+                  repr.apply(resultIndices) == input.apply(inputIndices));
+
+  z3::expr_vector qvars(z3ctx_.ctx());
+  for (auto &idx : resultIndices)
+    qvars.push_back(idx);
+  for (auto &idx : inputIndices)
+    qvars.push_back(idx);
+  return z3::forall(qvars, body);
 }
 
 z3::expr OpEncoder::encodeMaxF(const Operation &op) {
@@ -657,6 +740,13 @@ z3::expr OpEncoder::evalBody(const Operation::LinalgRegion &region,
       result = z3::ite(a <= b, a, b);
       break;
     }
+    case OpKind::FmaF: {
+      auto a = blockVals[bodyOp.operandIndices[0]];
+      auto b = blockVals[bodyOp.operandIndices[1]];
+      auto c = blockVals[bodyOp.operandIndices[2]];
+      result = a * b + c;
+      break;
+    }
     default:
       throw std::runtime_error("Unsupported body op in linalg.generic");
     }
@@ -833,6 +923,13 @@ z3::expr OpEncoder::encodeLinalgGeneric(const Operation &op) {
               auto a = blockVals[bop.operandIndices[0]],
                    b = blockVals[bop.operandIndices[1]];
               res = z3::ite(a <= b, a, b);
+              break;
+            }
+            case OpKind::FmaF: {
+              auto a = blockVals[bop.operandIndices[0]];
+              auto b = blockVals[bop.operandIndices[1]];
+              auto cv = blockVals[bop.operandIndices[2]];
+              res = a * b + cv;
               break;
             }
             default:

@@ -17,6 +17,7 @@ enum class OpKind {
   NegF,
   MaxF,
   MinF,
+  FmaF, // fused multiply-add: a*b + c
   AddI,
   SubI,
   MulI,
@@ -59,6 +60,8 @@ inline std::string opKindToString(OpKind k) {
     return "arith.maximumf";
   case OpKind::MinF:
     return "arith.minimumf";
+  case OpKind::FmaF:
+    return "cuda_tile.fma";
   case OpKind::AddI:
     return "arith.addi";
   case OpKind::SubI:
