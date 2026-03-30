@@ -931,8 +931,9 @@ z3::expr OpEncoder::encodeLinalgGeneric(const Operation &op) {
   z3::expr symAcc = z3ctx_.mkRealVar("_acc");
   symBlockVals.push_back(symAcc);
 
-  // Evaluate body
-  z3::expr bodyExpr = evalBody(region, symBlockVals);
+  // Evaluate body and simplify to normalize algebraic identities
+  // (e.g., neg(neg(x)) -> x, x + 0 -> x)
+  z3::expr bodyExpr = evalBody(region, symBlockVals).simplify();
 
   // Use Z3 expression string as signature.
   // Canonicalize by replacing all program-specific UF names (src_*, tgt_*,
