@@ -1,0 +1,37 @@
+# Build
+build/
+cmake-build-*/
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
+
+# Eval/fuzz outputs
+eval/results/
+eval/corpus/
+eval/synthetic/
+fuzz/results/
+fuzz/crashes/
+fuzz/corpus/
+
+# IDE / tooling caches
+.cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project-local notes
+PROJECT.md
+
+# Compiled binaries
+tensor-alive
+*.o
+*.a
+*.so
+*.dylib
