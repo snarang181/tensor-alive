@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# C++ formatting check (clang-format)
+cpp_files=$(git diff --cached --name-only --diff-filter=ACM -- '*.cpp' '*.h' '*.hpp' '*.cc' '*.cxx' || true)
+if [ -n "$cpp_files" ]; then
+    echo "Checking C++ formatting..."
+    unformatted=""
+    for f in $cpp_files; do
+        if ! clang-format -style=file --dry-run --Werror "$f" 2>/dev/null; then
+            unformatted="$unformatted $f"
+        fi
+    done
+    if [ -n "$unformatted" ]; then
+        echo "ERROR: The following C++ files are not formatted:"
+        for f in $unformatted; do echo "  $f"; done
+        echo "Run: clang-format -i -style=file $unformatted"
+        exit 1
+    fi
+fi
+
+# Python formatting check (ruff)
+py_files=$(git diff --cached --name-only --diff-filter=ACM -- '*.py' || true)
+if [ -n "$py_files" ]; then
+    echo "Checking Python formatting..."
+    if ! ruff format --check $py_files 2>/dev/null; then
+        echo "ERROR: Python files are not formatted."
+        echo "Run: ruff format $py_files"
+        exit 1
+    fi
+
+    echo "Linting Python files..."
+    if ! ruff check $py_files 2>/dev/null; then
+        echo "ERROR: Python lint errors found."
+        echo "Run: ruff check --fix $py_files"
+        exit 1
+    fi
+fi
+
+echo "Pre-commit checks passed."
